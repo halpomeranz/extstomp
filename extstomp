@@ -1,0 +1,161 @@
+#!/bin/bash
+# Hal Pomeranz (hrpomeranz@gmail.com) -- September 2024
+# Distributed under the Creative Commons Attribution-ShareAlike 4.0 license (CC BY-SA 4.0)
+
+usage() {
+    cat <<EOM
+extstomp -- Set inode times
+
+Usage: extstomp [-COvh] [-e nanosec | -E extra] -[macb] [-T time | -S sourcefile] file ...
+
+    Optional modifiers:
+    -C    Do not drop caches when program ends (changes may not be visible)
+    -O	  File system is "old": EXT3 or earlier (no fractional seconds)
+    -v    Be verbose and show all file timestamps after changes made
+    -h    Show this message and exit
+
+    Specify fractional seconds field (if not specified, random value will be used):
+    -e nanosec    Specify nanosecond value (will be bit shifted)
+    -E extra	  Specify exact field including extra bits (will not be bit shifted)
+
+    Time fields to set (must choose at least one, may choose multiple):
+    -m    Set mtime (file content last modified)
+    -a	  Set atime (file last access time)
+    -c	  Set ctime (metadata change time)
+    -b	  Set crtime (file creation time)
+
+    Specify time to set (must choose only one option):
+    -T time          Argument may be any format recognized by system "date" program.
+                     Time value cannot be earlier than 1901-12-13 20:45:52 UTC or later 
+                     than 2446-05-10 22:38:55 UTC.
+
+    -S sourcefile    Specify file path. Timestamps will be copied from source file exactly.
+                     -e, -E options will be ignored.
+
+EOM
+    exit 1
+}
+
+keep_cache=0
+not_ext4=0
+verbose=0
+time_prefixes=
+nanosec=
+time_string=
+time_extra=
+source_file=
+while getopts "macbT:S:AOCvhe:E:" opts; do
+    case ${opts} in
+	C) keep_cache=1
+	   ;;
+	O) not_ext4=1
+	   ;;
+	v) verbose=1
+	   ;;
+	h) usage
+	   ;;
+	e) nanosec=${OPTARG}
+	   ;;
+	E) time_extra=${OPTARG}
+	   ;;
+	m) time_prefixes="$time_prefixes m"
+	   ;;
+	a) time_prefixes="$time_prefixes a"
+	   ;;
+	c) time_prefixes="$time_prefixes c"
+	   ;;
+	b) time_prefixes="$time_prefixes cr"
+	   ;;
+	T) time_string=${OPTARG}
+	   ;;
+	S) source_file=${OPTARG}
+	   ;;
+	*) usage
+           ;;
+    esac
+done
+
+# Check command usage
+[[ -n "$time_prefixes" ]] || usage
+[[ -n "$nanosec" && -n "$time_extra" ]] && usage
+
+[[ -n "$time_string" && -n "$source_file" ]] && usage
+[[ -z "$time_string" && -z "$source_file" ]] && usage
+
+# TODO: fix this so it works on EXT3 and earlier
+#       need to create EXT[23] file system to get sample debugfs output
+[[ -n "$source_file" && $not_ext4 -gt 0 ]] && echo Copying timestamps currently only supported on EXT4 && exit 1
+
+# Clear options from positional parameters, leaving only file names
+shift $((OPTIND-1))
+
+# So that debugfs just gives plain text output
+export DEBUGFS_PAGER=cat
+
+
+if [[ -n "$time_string" ]]; then
+    # Convert user-supplied time string to epoch time
+    # Then compute the low 32bits which will be the time value for EXT[2-4]
+    epoch_time=$(date -d "$time_string" '+%s')
+    [[ $epoch_time -lt -2147483648 || $epoch_time -gt 15032385535 ]] && usage
+
+    adjusted_time=$(( $epoch_time + 2147483648 ))
+    time_lowbits=$(( ($adjusted_time % 4294967296) - 2147483648 ))
+
+    # If this is EXT4, the high bits from the epoch time become the low bits of the nanoseconds field
+    if [[ $not_ext4 -eq 0 && -z "$time_extra" ]]; then
+	time_highbits=$(( $adjusted_time / 4294967296 ))
+
+	# Generate a random 32bit nanoseconds value unless the user gave us one
+	[[ -z "$nanosec" ]] && nanosec="0x$(head /dev/urandom | tr -d -c 0-9a-f | cut -c1-8)"
+
+	# Mask off the top two bits of the nanoseconds value to avoid overflow
+	# Then shift the value right and add any extra time bits from the epoch time value
+	time_extra=$(( (($nanosec & 0x3fffffff) << 2) + $time_highbits ))
+    fi
+else           # copying value(s) from another file
+    source_fs=$(df "$source_file" | tail -1 | cut -f1 -d' ')
+    source_inode=$(ls -i "$source_file" | cut -f1 -d' ')
+fi
+
+# Loop over remaining file arguments
+# -- Figure out file system and inode number for each file
+# -- Set all time values requested by user
+# -- If verbose is set, show file info using "debugfs" (not "stat" because caches are only flushed at the end)
+for file in "$@"; do
+    file_system=$(df "$file" | tail -1 | cut -f1 -d' ')
+    file_inode=$(ls -i "$file" | cut -f1 -d' ')
+
+    if [[ -n "$time_string" ]]; then
+	timeval=$time_lowbits
+	extraval=$time_extra
+    fi
+
+    for pref in $time_prefixes; do
+	[[ "$pref" == 'cr' && $not_ext4 -gt 0 ]] && continue    # Creation date only in EXT4
+
+	# Typical debugfs output for EXT4
+	#    ctime: 0x66b37fc9:9d8e0ba8 -- Wed Aug  7 14:08:09 2024
+        #    atime: 0x66d47140:906c59d0 -- Sun Sep  1 13:50:56 2024
+        #    mtime: 0x66b37fc9:9d8e0ba8 -- Wed Aug  7 14:08:09 2024
+        #   crtime: 0x66b37fc9:9d8e0ba8 -- Wed Aug  7 14:08:09 2024
+	if [[ -n "$source_file" ]]; then
+	    fields=$(debugfs -R "stat <$source_inode>" "$source_fs" 2>/dev/null | grep -F "${pref}time:" |
+			 sed 's/^ *//' | cut -f2 -d' ')
+	    timeval=$(( $(echo $fields | cut -f1 -d:) ))
+	    extraval="0x$(echo $fields | cut -f2 -d:)"
+	fi
+	
+	debugfs -w -R "sif <$file_inode> ${pref}time @$timeval" "$file_system" 2>/dev/null
+	[[ $not_ext4 -eq 0 ]] &&
+	    debugfs -w -R "sif <$file_inode> ${pref}time_extra $extraval" "$file_system" 2>/dev/null
+    done
+
+    if [[ $verbose -gt 0 ]]; then
+	echo ===== $file
+	debugfs -R "stat <$file_inode>" "$file_system" 2>/dev/null | grep time:
+    fi
+done
+
+# Flush caches unless requested otherwise
+[[ $keep_cache -eq 0 ]] && echo 3 >/proc/sys/vm/drop_caches
