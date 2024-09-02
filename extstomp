@@ -115,26 +115,27 @@ if [[ -n "$time_string" ]]; then
     fi
 else           # copying value(s) from another file
     source_fs=$(df "$source_file" | tail -1 | cut -f1 -d' ')
-    source_inode=$(ls -i "$source_file" | cut -f1 -d' ')
+    source_inode=$(ls -id "$source_file" | cut -f1 -d' ')
 
     declare -A time_vals
     declare -A extra_vals
-    for pref in $time_prefixes; do
-	[[ "$pref" == 'cr' && $not_ext4 -gt 0 ]] && continue    # Creation date only in EXT4
 
-	# Typical debugfs output for EXT4
-	#    ctime: 0x66b37fc9:9d8e0ba8 -- Wed Aug  7 14:08:09 2024
-        #    atime: 0x66d47140:906c59d0 -- Sun Sep  1 13:50:56 2024
-        #    mtime: 0x66b37fc9:9d8e0ba8 -- Wed Aug  7 14:08:09 2024
-        #   crtime: 0x66b37fc9:9d8e0ba8 -- Wed Aug  7 14:08:09 2024
-	if [[ -n "$source_file" ]]; then
-	    fields=$(debugfs -R "stat <$source_inode>" "$source_fs" 2>/dev/null | grep -F "${pref}time:" |
-			 sed 's/^ *//' | cut -f2 -d' ')
-	    time_vals[$pref]=$(( $(echo $fields | cut -f1 -d:) ))
-	    extra_vals[$pref]="0x$(echo $fields | cut -f2 -d:)"
-	fi
-    done
+    # Can't pipe directly into the loop because that would put the loop in a subshell where
+    # variable assignments would be lost. So we have this tortured syntax. Sigh.
+    #
+    # Typical debugfs output on EXT4:
+    #    ctime: 0x66b90507:36b23f48 -- Sun Aug 11 14:37:59 2024
+    #    atime: 0x66cf5049:8f116430 -- Wed Aug 28 12:28:57 2024
+    #    mtime: 0x66b90507:36b23f48 -- Sun Aug 11 14:37:59 2024
+    #   crtime: 0x63dec3cb:b0d5bbf8 -- Sat Feb  4 15:44:59 2023
+    #
+    while read label fields junk; do
+	pref=$(echo $label | sed 's/time://')
+	time_vals[$pref]=$(( $(echo $fields | cut -f1 -d:) ))
+	extra_vals[$pref]="0x$(echo $fields | cut -f2 -d:)"
+    done< <(debugfs -R "stat <$source_inode>" "$source_fs" 2>/dev/null | grep -F time:)
 fi
+
 
 # Loop over remaining file arguments
 # -- Figure out file system and inode number for each file
@@ -142,7 +143,7 @@ fi
 # -- If verbose is set, show file info using "debugfs" (not "stat" because caches are only flushed at the end)
 for file in "$@"; do
     file_system=$(df "$file" | tail -1 | cut -f1 -d' ')
-    file_inode=$(ls -i "$file" | cut -f1 -d' ')
+    file_inode=$(ls -id "$file" | cut -f1 -d' ')
 
     for pref in $time_prefixes; do
 	[[ "$pref" == 'cr' && $not_ext4 -gt 0 ]] && continue    # Creation date only in EXT4
